@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+  />
+  <title>AR Hit-Test (with camera overlay fallback)</title>
+
+  <!-- Import map so "three" and examples resolve on Safari -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <style>
+    html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#000; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+    /* Shared canvas for both modes */
+    canvas#three { position:fixed; inset:0; z-index:1; }
+    /* Fallback camera video (hidden during WebXR mode) */
+    video#cam {
+      position:fixed; inset:0; width:100%; height:100%;
+      object-fit:cover; background:#000; z-index:0; display:none;
+    }
+    /* UI */
+    #top, #bottom, #diag {
+      position:fixed; z-index:9999;
+    }
+    #top { top:10px; left:50%; transform:translateX(-50%); color:#fff;
+      background:rgba(0,0,0,.5); padding:6px 10px; border-radius:8px; font-size:14px; }
+    #bottom { bottom:16px; left:50%; transform:translateX(-50%); display:flex; gap:8px; }
+    button {
+      padding:10px 14px; border-radius:10px; border:1px solid #444;
+      background:#111; color:#fff; font-weight:600; cursor:pointer;
+    }
+    #diag {
+      bottom:16px; left:16px; color:#fff; background:rgba(0,0,0,.5);
+      padding:6px 10px; border-radius:8px; font-size:12px;
+    }
+    /* In fallback mode we let clicks pass through the canvas to the page:
+       but we listen on document, so this is safe and keeps buttons clickable. */
+    .fallback canvas#three { pointer-events:none; }
+  </style>
+</head>
+<body>
+  <!-- Fallback video feed -->
+  <video id="cam" playsinline webkit-playsinline autoplay muted></video>
+
+  <!-- One canvas used in BOTH modes -->
+  <canvas id="three"></canvas>
+
+  <div id="top">Move device to find a surface. If AR not supported, tap to spawn ~2 m ahead.</div>
+  <div id="bottom">
+    <button id="enterXR" style="display:none;">Enter AR</button>
+    <button id="startCam" style="display:none;">Start camera (fallback)</button>
+    <button id="clear">Clear cubes</button>
+  </div>
+  <div id="diag"></div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+
+    // --- DOM refs
+    const video = document.getElementById('cam');
+    const canvas = document.getElementById('three');
+    const enterXRBtn = document.getElementById('enterXR');
+    const startCamBtn = document.getElementById('startCam');
+    const clearBtn = document.getElementById('clear');
+    const diag = document.getElementById('diag');
+
+    // --- Three setup (shared)
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearAlpha(0);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 0.01, 100);
+    camera.position.set(0, 1.5, 3);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 1.0));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(1,2,1);
+    scene.add(dir);
+
+    const cubes = new THREE.Group();
+    scene.add(cubes);
+
+    // Optional desktop controls (handy in fallback mode)
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enablePan = false;
+    controls.enableDamping = true;
+
+    // --- State
+    let usingXR = false;
+    let xrHitTestSource = null;
+    let xrRefSpace = null;
+    let reticle = null;
+
+    const log = (m) => (diag.textContent = m);
+
+    // --- Build a reticle (only shown during XR when we have a hit)
+    function makeReticle() {
+      const geo = new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI/2);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x00ff99 });
+      const r = new THREE.Mesh(geo, mat);
+      r.matrixAutoUpdate = false;
+      r.visible = false;
+      scene.add(r);
+      return r;
+    }
+
+    // --- Fallback: start camera and run normal render loop
+    async function startFallback() {
+      document.body.classList.add('fallback');
+      startCamBtn.style.display = 'none';
+      video.style.display = 'block';
+      usingXR = false;
+
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error('getUserMedia unavailable — use http://localhost or HTTPS');
+        }
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ exact:'environment' } }, audio:false });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ ideal:'environment' }, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+        }
+        video.srcObject = stream;
+        await video.play();
+        log('Fallback camera started ✅');
+        animateFallback();
+      } catch (e) {
+        console.error(e);
+        log(`Fallback camera error: ${e.name || e.message}`);
+        alert(`Camera error: ${e.name || e.message}\nSafari: Settings ▸ Websites ▸ Camera → Allow. macOS Privacy ▸ Camera.`);
+      }
+    }
+
+    // Tap/click to spawn ~2m ahead (fallback only)
+    function spawnAhead() {
+      const size = 0.15 + Math.random()*0.2;
+      const geo = new THREE.BoxGeometry(size, size, size);
+      const mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color().setHSL(Math.random(), 0.6, 0.55),
+        roughness: 0.6, metalness: 0.1
+      });
+      const cube = new THREE.Mesh(geo, mat);
+      const forward = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+      cube.position.copy(camera.position).addScaledVector(forward, 2.0);
+      cube.position.x += (Math.random()-0.5)*0.3;
+      cube.position.y += (Math.random()-0.5)*0.3;
+      cube.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+      cubes.add(cube);
+    }
+
+    document.addEventListener('pointerdown', (e) => {
+      if (usingXR) return; // XR uses its own tap handler
+      if (e.target.closest('#bottom') || e.target.closest('#top')) return;
+      spawnAhead();
+    }, { passive:true });
+
+    // --- WebXR: request session with hit-test
+    async function startXR() {
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: document.body }
+        });
+
+        usingXR = true;
+        enterXRBtn.style.display = 'none';
+        startCamBtn.style.display = 'none';
+        video.style.display = 'none';
+        document.body.classList.remove('fallback');
+
+        renderer.xr.enabled = true;
+        renderer.xr.setReferenceSpaceType('local');
+        await renderer.xr.setSession(session);
+
+        // Reticle + hit test setup
+        reticle = makeReticle();
+
+        session.addEventListener('end', () => {
+          xrHitTestSource?.cancel?.();
+          xrHitTestSource = null;
+          usingXR = false;
+          // If XR ends, offer fallback camera
+          startCamBtn.style.display = 'inline-block';
+        });
+
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        xrRefSpace = await session.requestReferenceSpace('local');
+        xrHitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+        // Tap to place cube at reticle
+        const placeCube = () => {
+          if (!reticle?.visible) return;
+          const size = 0.15 + Math.random()*0.2;
+          const geo = new THREE.BoxGeometry(size, size, size);
+          const mat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color().setHSL(Math.random(), 0.6, 0.55),
+            roughness: 0.6, metalness: 0.1
+          });
+          const cube = new THREE.Mesh(geo, mat);
+          cube.position.setFromMatrixPosition(reticle.matrix);
+          cube.quaternion.setFromRotationMatrix(reticle.matrix);
+          cubes.add(cube);
+        };
+
+        // XR input (controller 0) + screen taps
+        const controller = renderer.xr.getController(0);
+        controller.addEventListener('select', placeCube);
+        scene.add(controller);
+        window.addEventListener('pointerdown', placeCube);
+
+        // XR render loop with hit test update
+        renderer.setAnimationLoop((time, frame) => {
+          if (frame && xrHitTestSource && xrRefSpace) {
+            const hits = frame.getHitTestResults(xrHitTestSource);
+            if (hits.length > 0) {
+              const pose = hits[0].getPose(xrRefSpace);
+              reticle.visible = true;
+              reticle.matrix.fromArray(pose.transform.matrix);
+            } else {
+              reticle.visible = false;
+            }
+          }
+          renderer.render(scene, camera);
+        });
+
+        log('AR session started ✅ Move device to detect surfaces.');
+      } catch (e) {
+        console.error(e);
+        log(`XR start failed: ${e.name || e.message}`);
+        // If XR fails (e.g., on desktop Safari), show fallback button
+        startCamBtn.style.display = 'inline-block';
+      }
+    }
+
+    // --- Clear cubes
+    clearBtn.addEventListener('click', () => {
+      for (let i = cubes.children.length - 1; i >= 0; i--) {
+        const m = cubes.children[i];
+        m.geometry?.dispose?.();
+        m.material?.dispose?.();
+        cubes.remove(m);
+      }
+    });
+
+    // --- Resize
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    // --- Fallback animation loop
+    function animateFallback() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animateFallback);
+    }
+
+    // --- Capability detection and UI setup
+    (async () => {
+      const secure = window.isSecureContext;
+      const mediaAvail = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      const xrAvail = !!navigator.xr && await navigator.xr.isSessionSupported?.('immersive-ar');
+
+      log(`Secure:${secure} • media:${mediaAvail} • XR:${!!xrAvail}`);
+
+      if (xrAvail) {
+        enterXRBtn.style.display = 'inline-block';
+        enterXRBtn.addEventListener('click', startXR);
+      } else {
+        startCamBtn.style.display = 'inline-block';
+        startCamBtn.addEventListener('click', startFallback);
+      }
+    })();
+  </script>
+</body>
+</html>
